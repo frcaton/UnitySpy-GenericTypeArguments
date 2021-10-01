@@ -1,7 +1,7 @@
-﻿using System;
-
-namespace HackF5.UnitySpy.Detail
+﻿namespace HackF5.UnitySpy.Detail
 {
+    using System;
+    using System.Collections.Generic;
     using JetBrains.Annotations;
 
     /// <summary>
@@ -16,7 +16,7 @@ namespace HackF5.UnitySpy.Detail
             : base(image, address)
         {
             this.Data = this.ReadPtr(0x0);
-            this.Attrs = this.ReadUInt32(this.Process.SizeOfPtr);
+            this.Attrs = this.ReadUInt32(this.Process.SizeOfPtr);            
         }
 
         public uint Attrs { get; }
@@ -45,6 +45,6 @@ namespace HackF5.UnitySpy.Detail
             }
         }
 
-        public object GetValue(IntPtr address) => this.Process.ReadManaged(this, address);
+        public object GetValue(List<TypeInfo> genericTypeArguments, IntPtr address) => this.Process.ReadManaged(this, genericTypeArguments, address);
     }
 }

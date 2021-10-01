@@ -1,6 +1,7 @@
 ﻿namespace HackF5.UnitySpy.Detail
 {
     using System;
+    using System.Collections.Generic;
     using System.ComponentModel;
     using System.Diagnostics;
     using System.Runtime.InteropServices;
@@ -14,27 +15,21 @@
     [PublicAPI]
     public class ProcessFacade
     {
-        private readonly bool is64Bits;
+        private readonly MonoLibraryOffsets monoLibraryOffsets;
 
         public ProcessFacade(int processId)
         {
             this.Process = Process.GetProcessById(processId);
-            is64Bits = Native.IsWow64Process(this.Process);
-
-            string mainModulePath = Native.GetMainModuleFileName(this.Process);
-
-            FileVersionInfo myFileVersionInfo = FileVersionInfo.GetVersionInfo(mainModulePath);
-            string unityVersion = myFileVersionInfo.FileVersion;
-            this.MonoLibraryOffsets = MonoLibraryOffsets.GetOffsets(unityVersion, is64Bits);
+            this.monoLibraryOffsets = MonoLibraryOffsets.GetOffsets(Native.GetMainModuleFileName(this.Process));
         }
 
         public Process Process { get; }
 
-        public MonoLibraryOffsets MonoLibraryOffsets { get; }
+        public MonoLibraryOffsets MonoLibraryOffsets => this.monoLibraryOffsets;
 
-        public int SizeOfPtr => is64Bits ? 8 : 4;
+        public int SizeOfPtr => this.monoLibraryOffsets.Is64Bits ? 8 : 4;
 
-        public bool Is64Bits => is64Bits;
+        public bool Is64Bits => this.monoLibraryOffsets.Is64Bits;
 
         public string ReadAsciiString(IntPtr address, int maxSize = 1024)
         {
@@ -53,7 +48,7 @@
             return this.ReadBufferValue(address, sizeof(long), b => b.ToInt64());
         }
 
-        public object ReadManaged([NotNull] TypeInfo type, IntPtr address)
+        public object ReadManaged([NotNull] TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
         {
             if (type == null)
             {
@@ -106,22 +101,22 @@
                     return this.ReadManagedString(address);
 
                 case TypeCode.SZARRAY:
-                    return this.ReadManagedArray(type, address);
+                    return this.ReadManagedArray(type, genericTypeArguments, address);
 
                 case TypeCode.VALUETYPE:
                     try
                     {
-                        return this.ReadManagedStructInstance(type, address);
+                        return this.ReadManagedStructInstance(type, genericTypeArguments, address);
                     } catch (Exception e)
                     {
                         return this.ReadInt32(address);
                     }
 
                 case TypeCode.CLASS:
-                    return this.ReadManagedClassInstance(type, address);
+                    return this.ReadManagedClassInstance(type, genericTypeArguments, address);
 
                 case TypeCode.GENERICINST:
-                    return this.ReadManagedGenericObject(type, address);
+                    return this.ReadManagedGenericObject(type, genericTypeArguments, address);
 
                 //// this is the type code for generic structs class-internals.h_MonoGenericParam. Good luck with
                 //// that!
@@ -130,11 +125,10 @@
                 //// It's probably better to have something incomplete here
                 //// that will raise an exception later on than throwing the exception right away?
                 case TypeCode.OBJECT:
-                    return this.ReadManagedGenericObject(type, address);
+                    return this.ReadManagedGenericObject(type, genericTypeArguments, address);
 
                 case TypeCode.VAR:
-                    // Really not sure this is the way to do it
-                    return this.ReadInt32(address);
+                    return this.ReadManagedVar(type, genericTypeArguments, address);
 
                 // may need supporting
                 case TypeCode.ARRAY:
@@ -176,7 +170,7 @@
             return buffer;
         }
 
-        public IntPtr ReadPtr(IntPtr address) => (IntPtr) (this.is64Bits ? this.ReadUInt64(address) : this.ReadUInt32(address));
+        public IntPtr ReadPtr(IntPtr address) => (IntPtr)(this.Is64Bits ? this.ReadUInt64(address) : this.ReadUInt32(address));
 
         public uint ReadUInt32(IntPtr address)
         {
@@ -216,7 +210,7 @@
             }
         }
 
-        private object[] ReadManagedArray(TypeInfo type, IntPtr address)
+        private object[] ReadManagedArray(TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
         {
             var ptr = this.ReadPtr(address);
             if (ptr == Constants.NullPtr)
@@ -229,36 +223,60 @@
             var arrayDefinition = type.Image.GetTypeDefinition(arrayDefinitionPtr);
             var elementDefinition = type.Image.GetTypeDefinition(this.ReadPtr(arrayDefinitionPtr));
 
-            var elementSize = MonoLibraryOffsets.UsesArrayDefinitionSize ? arrayDefinition.Size : SizeOfPtr;
-
-            var count = this.ReadInt32(ptr + SizeOfPtr * 3);
+            var count = this.ReadInt32(ptr + (this.SizeOfPtr * 3));
             var start = ptr + SizeOfPtr * 4;
             var result = new object[count];
             for (var i = 0; i < count; i++)
             {
-                result[i] = elementDefinition.TypeInfo.GetValue(start + i * elementSize);
+                result[i] = elementDefinition.TypeInfo.GetValue(genericTypeArguments, start + (i * arrayDefinition.Size));
             }
 
             return result;
         }
 
-        private ManagedClassInstance ReadManagedClassInstance(TypeInfo type, IntPtr address)
+        private ManagedClassInstance ReadManagedClassInstance(TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
         {
             var ptr = this.ReadPtr(address);
             return ptr == Constants.NullPtr
                 ? default
-                : new ManagedClassInstance(type.Image, ptr);
+                : new ManagedClassInstance(type.Image, genericTypeArguments, ptr);
         }
 
-        private object ReadManagedGenericObject(TypeInfo type, IntPtr address)
+        private object ReadManagedGenericObject(TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
         {
+
+            // TODO check if this is correct because we are getting the wrong class instance for GENERICINST
             var genericDefinition = type.Image.GetTypeDefinition(this.ReadPtr(type.Data));
+
             if (genericDefinition.IsValueType)
             {
-                return new ManagedStructInstance(genericDefinition, address);
+                return new ManagedStructInstance(genericDefinition, genericTypeArguments, address);
             }
 
-            return this.ReadManagedClassInstance(type, address);
+            return this.ReadManagedClassInstance(type, genericTypeArguments, address);
+        }
+
+        private object ReadManagedVar(TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
+        {
+            var monoGenericParamPtr = type.Data;
+            var monoGenericParamAddress = this.ReadPtr(monoGenericParamPtr);
+
+            //// we need to move three pointer sizes to get to the MonoClass Pointer
+            // See _MonoGenericContainer
+            // (https://github.com/Unity-Technologies/mono/blob/unity-master/mono/metadata/class-internals.h)
+            // var genericDefinitionPtr = monoGenericContainerAddress + (3 * this.SizeOfPtr);
+            // var genericDefinition = type.Image.GetTypeDefinition(this.ReadPtr(genericDefinitionPtr));
+
+            int numberOfGenericArgument = this.ReadInt32(monoGenericParamPtr + this.SizeOfPtr);
+
+            int offset = 0;
+            for (int i = 0; i < numberOfGenericArgument; i++)
+            {
+                offset += this.GetSize(genericTypeArguments[i].TypeCode) - this.SizeOfPtr;
+            }
+
+            var genericArgumentType = genericTypeArguments[numberOfGenericArgument];
+            return this.ReadManaged(genericArgumentType, null, address + offset);
         }
 
         private string ReadManagedString(IntPtr address)
@@ -277,10 +295,10 @@
                 b => Encoding.Unicode.GetString(b, 0, 2 * length));
         }
 
-        private object ReadManagedStructInstance(TypeInfo type, IntPtr address)
+        private object ReadManagedStructInstance(TypeInfo type, List<TypeInfo> genericTypeArguments, IntPtr address)
         {
             var definition = type.Image.GetTypeDefinition(type.Data);
-            var obj = new ManagedStructInstance(definition, address);
+            var obj = new ManagedStructInstance(definition, genericTypeArguments, address);
             //var t = obj.GetValue<object>("enumSeperator");
             return obj.TypeDefinition.IsEnum ? obj.GetValue<object>("value__") : obj;
         }
@@ -322,6 +340,83 @@
             finally
             {
                 bufferHandle.Free();
+            }
+        }
+
+        private int GetSize(TypeCode typeCode)
+        {
+            switch (typeCode)
+            {
+                case TypeCode.BOOLEAN:
+                    return sizeof(bool);
+
+                case TypeCode.CHAR:
+                    return sizeof(char);
+
+                case TypeCode.I1:
+                    return sizeof(byte);
+
+                case TypeCode.U1:
+                    return sizeof(sbyte);
+
+                case TypeCode.I2:
+                    return sizeof(short);
+
+                case TypeCode.U2:
+                    return sizeof(ushort);
+
+                case TypeCode.I:
+                case TypeCode.I4:
+                    return sizeof(int);
+
+                case TypeCode.U:
+                case TypeCode.U4:
+                    return sizeof(uint);
+
+                case TypeCode.I8:
+                    return sizeof(long);
+
+                case TypeCode.U8:
+                    return sizeof(ulong);
+
+                case TypeCode.R4:
+                case TypeCode.R8:
+                    return sizeof(char);
+
+                case TypeCode.STRING:
+                case TypeCode.SZARRAY:
+                case TypeCode.VALUETYPE:
+                case TypeCode.CLASS:
+                case TypeCode.GENERICINST:
+                case TypeCode.OBJECT:
+                case TypeCode.VAR:
+                    return SizeOfPtr;
+
+                // may need supporting
+                case TypeCode.ARRAY:
+                case TypeCode.ENUM:
+                case TypeCode.MVAR:
+
+                //// junk
+                case TypeCode.END:
+                case TypeCode.VOID:
+                case TypeCode.PTR:
+                case TypeCode.BYREF:
+                case TypeCode.TYPEDBYREF:
+                case TypeCode.FNPTR:
+                case TypeCode.CMOD_REQD:
+                case TypeCode.CMOD_OPT:
+                case TypeCode.INTERNAL:
+                case TypeCode.MODIFIER:
+                case TypeCode.SENTINEL:
+                case TypeCode.PINNED:
+                    throw new ArgumentException($"Cannot get size of types '{typeCode}'.");
+
+                default:
+                    throw new ArgumentOutOfRangeException(
+                        nameof(typeCode),
+                        typeCode,
+                        $"Cannot get size of unknown data type '{typeCode}'.");
             }
         }
     }
